@@ -1,4 +1,0 @@
-[submodule "linux"]
-	path = linux
-	url = https://github.com/beagleboard/linux.git
-	branch = v5.10.168-ti-r83
