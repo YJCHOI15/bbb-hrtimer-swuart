@@ -66,8 +66,9 @@ static struct device *swuart_device;
 /********************************************************/
 
 /******************** 변수 선언 *************************/
-static ktime_t bit_0p5;        //  비트
-static ktime_t bit_period;     // 1.0 비트
+static ktime_t bit_period;     // 1.0 비트 주기
+static ktime_t bit_1p5;        // 1.5 비트 주기
+static ktime_t bit_0p2;        
 
 // tx 변수
 #define BUF_SIZE 256
@@ -88,29 +89,50 @@ static int rx_buffer_head;                     // ring buffer 헤드
 static int rx_buffer_tail;                     // ring buffer 테일
 static int rx_bit_count;                       // 0~8 (8이면 stop 샘플 타이밍)
 static char rx_data;                           // 현재 수신 중인 1바이트
-static volatile bool timer_running;            // 타이머 상태 확인
+static volatile bool is_rx_active;
 /********************************************************/
 
+/**
+ * rx_irq_handler() - RX 스타트 비트 검출 ISR
+ * @irq:   요청된 인터럽트 번호
+ * @dev_id: 공유 IRQ 시 식별용 포인터이나 본 드라이버에서는 사용하지 않음
+ *
+ * 1) GPIO_RX에서 falling edge가 발생했을 때 호출됨(스타트 비트 시작을 의미)
+ * 2) 이미 프레임을 수신 중이 아니면(is_rx_active == false) 수신 상태로 전환
+ * 3) 수신 중 재진입을 막기 위해 해당 GPIO IRQ를 disable_irq_nosync()로 비활성화
+ * 4) 비트 카운터와 RX 누적 변수 초기화 후, hrtimer를 1.0비트 지연(bit_period)으로
+ *    스케줄링하여 다음 샘플링 시점을 예약
+ */
 static irqreturn_t rx_irq_handler(int irq, void *dev_id) {
 
-        // 스타트 비트 감지
-        if (!timer_running) {
-
-                // 프레임 시작 즉시 초기화
-                rx_bit_count = 0;
-                rx_data = 0;
-                timer_running = true;
+        // IDLE 상태일 때만 수신 프로세스 시작
+        if (!is_rx_active) {
+                printk(KERN_DEBUG "RX: FALLING EDGE (START BIT: %d)\n", GPIO_READ(GPIO_RX));
+                is_rx_active = true;
 
                 // 진행 중 재진입 방지
                 disable_irq_nosync(irq_number);
 
-                // 얼마나 지연시키냐가 관건 -> bit0 중앙에서 첫 샘플
-                hrtimer_start(&rx_timer, bit_0p5, HRTIMER_MODE_REL);
+                rx_bit_count = 0;
+                rx_data = 0;
+
+                // D0 실제 샘플링 시점 = (하강 엣지) + (IRQ latnecy) + (?? 비트)
+                // 가장 이상적인 타이밍 기준점은 D0 비트의 정중앙
+                // hrtimer_start(&rx_timer, bit_1p5, HRTIMER_MODE_REL);
+                hrtimer_start(&rx_timer, bit_period, HRTIMER_MODE_REL);
         }
         
         return IRQ_HANDLED;
 }
 
+/**
+ * buffer_push() - RX 링버퍼에 1바이트를 push
+ * @data:  저장할 1바이트 데이터
+ *
+ * - spin_lock_irqsave로 RX 버퍼 보호(IRQ 컨텍스트 포함 동시 접근 대비)
+ * - 버퍼가 가득 찬 경우 가장 오래된 데이터를 한 칸 버리고(head 덮어쓰기) 진행
+ * - 헤드를 한 칸 전진시킴
+ */
 static void buffer_push(char data) {
 
         unsigned long flags;
@@ -124,6 +146,18 @@ static void buffer_push(char data) {
         spin_unlock_irqrestore(&rx_lock, flags);
 }
 
+/**
+ * buffer_pop() - RX 링버퍼에서 1바이트를 pop
+ * @data:  유저에게 반환할 바이트를 저장할 포인터
+ *
+ * - spin_lock_irqsave로 동시성 보호
+ * - 비어 있으면 -1을 반환
+ * - 데이터가 있으면 *data에 대입 후 테일을 한 칸 전진
+ *
+ * 반환:
+ * - 0: 성공적으로 1바이트 pop
+ * - -1: 버퍼 비어 있음
+ */
 static int buffer_pop(char *data) {
 
         unsigned long flags;        
@@ -141,6 +175,22 @@ static int buffer_pop(char *data) {
         return ret;
 }
 
+/**
+ * tx_timer_callback() - TX 비트 타이머 콜백
+ * @timer: hrtimer 포인터
+ *
+ * - tx_bit_idx 상태에 따라 다음 동작을 수행
+ *   - -1: 스타트 비트(LOW) 출력
+ *   - 0~7: LSB-first로 데이터 비트 출력
+ *   - 8: 스톱 비트(HIGH) 출력
+ *   - 9이상: 전송 완료로 간주하여 complete(&tx_done) 호출하고 타이머 중지
+ * - hrtimer_forward로 이전 만료 시각 기준 정확히 1비트 주기만큼 전진시켜
+ *   위상 드리프트를 방지(지터 누적 최소화 목적)
+ *
+ * 반환:
+ * - HRTIMER_RESTART: 다음 비트를 위해 타이머 재시작
+ * - HRTIMER_NORESTART: 바이트 전송 종료
+ */
 static enum hrtimer_restart tx_timer_callback(struct hrtimer *timer) {
         if (tx_bit_idx == -1) {
                 GPIO_CLEAR(GPIO_TX);              // Start bit
@@ -165,37 +215,52 @@ static enum hrtimer_restart tx_timer_callback(struct hrtimer *timer) {
         return HRTIMER_RESTART;
 }
 
+/**
+ * rx_timer_callback() - RX 비트 샘플링 타이머 콜백
+ * @timer: hrtimer 포인터
+ *
+ * - rx_bit_count 기준으로 8개 데이터 비트를 LSB-first로 수집
+ * - 각 비트마다 GPIO_READ(GPIO_RX) 샘플 후 rx_data의 해당 비트에 OR 연산으로 누적
+ * - 8비트 수집 완료 후 스톱 비트를 1로 확인하면 buffer_push(rx_data) 수행
+ *   스톱 비트가 0이면 프레이밍 에러로 간주하여 폐기
+ * - 프레임 종료 시 is_rx_active=false로 전환하고 enable_irq()로 다음 프레임 엣지 검출을
+ *   재허용
+ *
+ * 타이밍:
+ * - rx_irq_handler에서 예약한 최초 샘플링 시점 이후, 매 비트마다 bit_period만큼 forward하여
+ *   중앙 샘플링에 가깝게 유지하려고 함
+ *
+ * 반환:
+ * - 데이터 비트 수집 중: HRTIMER_RESTART
+ * - 프레임 종료: HRTIMER_NORESTART
+ */
 static enum hrtimer_restart rx_timer_callback(struct hrtimer *timer) {
         
         int cur_bit;
         cur_bit = GPIO_READ(GPIO_RX);
         
+        // 데이터 비트 샘플링 (D0 ~ D7)
         if (rx_bit_count < 8) {
                 rx_data |= (cur_bit << rx_bit_count);
                 rx_bit_count++;
                 printk(KERN_DEBUG "RX: data bit%d recv%d\n", rx_bit_count, cur_bit);
-                
-                // 위상 고정: 비트 주기만큼 정확히 전진
                 hrtimer_forward(timer, hrtimer_get_expires(timer), bit_period);
                 return HRTIMER_RESTART;
         }
         
-        // stop 비트 중앙 샘플 타이밍 (바이트 확정)
+        // Stop 비트 샘플링 (rx_bit_count == 8)
         if (cur_bit == 1) {
                 buffer_push(rx_data);
                 printk(KERN_DEBUG "RX: 8bit data RX complete: 0x%02x\n", rx_data);
         } else {
                 printk(KERN_DEBUG "RX: framing error (stop=%d), drop 0x%02x\n", cur_bit, rx_data);
         }
-
-        // 프레임 종료
-        timer_running = false;
-        rx_bit_count = 0;
-        rx_data = 0;
-
-        // 다음 프레임을 위한 RX IRQ 재활성화
+        
+        // 수신 종료 및 다음 프레임을 위한 초기화
+        is_rx_active = false;
         enable_irq(irq_number);
         return HRTIMER_NORESTART;
+        
 }
 
  
@@ -211,6 +276,22 @@ static int swuart_hr_release(struct inode* inode, struct file* file) {
         return 0;
 }
 
+/**
+ * swuart_hr_read() - 사용자 공간으로 수신 바이트를 복사
+ * @file: VFS file
+ * @buf:  사용자 버퍼 포인터
+ * @len:  요청 길이
+ * @off:  파일 오프셋(미사용)
+ *
+ * 동작:
+ * - 내부 링버퍼에서 최대 min(len, BUF_SIZE) 바이트까지 pop하여 temp_buf에 모음
+ * - 가용 데이터가 0바이트면 즉시 0을 반환
+ * - 가용 바이트 수만큼 copy_to_user로 전달
+ *
+ * 반환:
+ * - 전달한 바이트 수
+ * - copy_to_user 실패 시 -EFAULT
+ */
 static ssize_t swuart_hr_read(struct file* file, char* buf, size_t len, loff_t* off) {
         ssize_t i = 0;
         char temp_buf[BUF_SIZE];
@@ -233,6 +314,27 @@ static ssize_t swuart_hr_read(struct file* file, char* buf, size_t len, loff_t* 
         return i;
 }
 
+/**
+ * swuart_hr_write() - 사용자 공간에서 바이트열을 받아 비트뱅잉으로 송신
+ * @file: VFS file
+ * @buf:  사용자 버퍼 포인터
+ * @len:  전송할 길이
+ * @off:  파일 오프셋(미사용)
+ *
+ * 동작:
+ * - 최대 msg 배열 크기만큼만 수용
+ * - copy_from_user로 커널 버퍼로 복사
+ * - 각 바이트마다:
+ *   1) tx_byte에 저장하고 tx_bit_idx=-1로 초기화
+ *   2) init_completion(&tx_done) 후 hrtimer로 비트 전송 시작
+ *   3) wait_for_completion(&tx_done)로 해당 바이트가 끝날 때까지 블로킹
+ *
+ * 반환:
+ * - 성공 시 전송한 바이트 수 len
+ * - copy_from_user 실패 시 -EFAULT
+ *
+ * 동기 블로킹 전송이므로 긴 버퍼를 쓰면 호출 스레드가 그만큼 오래 대기
+ */
 static ssize_t swuart_hr_write(struct file* file, const char* buf, size_t len, loff_t* off) {
         size_t i;
         
@@ -322,23 +424,24 @@ static int __init swuart_module_init(void) {
                 goto err_class;
         }
 
-        // 타이밍 상수 초기화
-        bit_0p5 = ns_to_ktime(BIT_DELAY_NS / 2);
-        bit_period = ns_to_ktime(BIT_DELAY_NS);
-
+        
         // 타이머 및 completion 초기화
         hrtimer_init(&tx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
         tx_timer.function = tx_timer_callback;
         init_completion(&tx_done);
-
+        
         hrtimer_init(&rx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
         rx_timer.function = rx_timer_callback;
-
-        // RX 버퍼 초기화
+        
+        // RX 관련 초기화
         memset(rx_buffer, 0, BUF_SIZE);
         rx_buffer_head = 0;      
         rx_buffer_tail = 0;  
-        timer_running = false;
+
+        bit_period = ns_to_ktime(BIT_DELAY_NS);
+        bit_1p5 = ns_to_ktime(BIT_DELAY_NS * 3 / 2);
+        bit_0p2 = ns_to_ktime(BIT_DELAY_NS * 2 / 10);
+        is_rx_active = false;
 
         return 0;
 
