@@ -1,6 +1,6 @@
 # SW UART for BeagleBone Black
 
-AM335x BBB에서 GPIO 비트뱅잉과 커널 hrtimer로 구현한 SW UART LKM에 관한 프로젝트입니다.  
+AM335x BeagleBone Black에서 GPIO 비트뱅잉과 커널 hrtimer로 구현한 SW UART LKM에 관한 프로젝트입니다.  
 TX는 안정화되었고, RX는 일반 커널 환경의 IRQ 지연 문제로 한계를 확인했습니다.
 
 ---
