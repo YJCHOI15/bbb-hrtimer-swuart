@@ -1,7 +1,9 @@
 # SW UART for BeagleBone Black
 
-AM335x BeagleBone Black에서 GPIO 비트뱅잉과 커널 hrtimer로 구현한 SW UART LKM에 관한 프로젝트입니다.  
-TX는 안정화되었고, RX는 일반 커널 환경의 IRQ 지연 문제로 한계를 확인했습니다.
+HW UART 자원이 부족한 임베디드 리눅스 환경의 제약을 극복하고자, BeagleBone Black 보드에서 GPIO와 커널 고해상도 타이머(hrtimer)를 이용한 9600bps SW UART 디바이스 드라이버를 LKM(Loadable Kernel Module) 형태로 개발했습니다.
+
+정밀한 타이밍 제어로 안정적인 송신(TX) 기능을 구현했으며, 수신(RX) 기능 구현 과정에서 발생하는 실시간성(Real-time) 이슈를 분석하고 이에 대한 기술적 해결 방안을 제시했습니다.
+
 
 ---
 
@@ -19,7 +21,7 @@ TX는 안정화되었고, RX는 일반 커널 환경의 IRQ 지연 문제로 한
 
 ---
 
-## 아키텍처 개요
+## 시스템 아키텍처
 
 TX: hrtimer 만료마다 GPIO를 SET/CLEAR하며 Start → D0~D7(LSB-first) → Stop 순으로 출력
 
@@ -44,17 +46,26 @@ RX: GPIO Falling Edge IRQ로 Start 검출 → hrtimer로 비트 중앙 시점에
 
 ---
 
-## 개발 환경
+## 개발 스택
 
-보드: BeagleBone Black (TI AM335x, ARMv7)
+**보드**: BeagleBone Black (TI AM3358 ARM Cortex-A8)
 
-커널: 5.10.168-ti-r71 (일반 커널, PREEMPT_RT 미적용)
+**언어**: C
 
-Debian 12
+**OS / 커널**: Debian on ARM, Linux Kernel (v5.10)
 
-호스트: Ubuntu 22.04 (WSL2) + VSCode
+**Tool**: gcc-arm-linux-gnueabihf, Makefile, Git, udev, Saleae Logic 2 (신호 분석), putty (ssh)
 
-툴: arm-linux-gnueabihf- 크로스 컴파일러, Saleae Logic 2
+**핵심 기술**: Device Driver (LKM), Kernel Timer (hrtimer), Interrupt Handling (IRQ), GPIO,  Cross-Compilation, Bit-Banging
+
+---
+
+## Out-of-Tree 방식 모듈 구현
+1. 호스트 PC(WSL2)에서 타겟용 커널 모듈을 크로스 컴파일할 수 있는 빌드 시스템을 구축했습니다. 
+<img width="928" height="439" alt="image" src="https://github.com/user-attachments/assets/f006f6f9-fa5a-428c-b65e-5627beb7bc80" /> <BR><BR>
+
+2. udev와 연동하여 모듈 로드 시 /sys/class 를 감시하다가 아래와 같은 dev 파일을 읽어서 주번호와 부번호를 알아내고, /dev 아래에 해당 디바이스 노드를 생성합니다.
+<img width="928" height="65" alt="image" src="https://github.com/user-attachments/assets/9d32b15a-2730-430d-b41e-763cdae3a5de" />
 
 ---
 
@@ -139,5 +150,16 @@ sudo ./swuart_rx_test
     - **PREEMPT_RT 커널** 적용해 IRQ를 스레드화하고 latency를 축소
     - 비글본 블랙의 PRU(Programmable Real-time Unit)를 사용해 데이터 비트 샘플링을 하드 RT로 수행하여 us 지터 제거
     - RTOS: 리눅스 대신 FreeRTOS와 같은 실시간 운영체제를 사용하여 커널 단순화와 결정적 스케줄링을 통해 인터럽트 및 태스크 지연 축소
- 
-이번 프로젝트를 통해 일반 리눅스 커널 + hrtimer만으로는 RX 실시간 안정화가 어렵다는 점을 확인했으며, 실시간 처리를 위해 PRU/RTOS 등 하드 RT 자원의 필요성을 절실히 체감했습니다. 
+
+--- 
+
+## 프로젝트 성과 및 배운점
+
+1. 안정적으로 동작하는 커널 기반 SW UART 송신 드라이버 개발을 완료했습니다. 
+
+2. 실시간 시스템에서 발생하는 IRQ Latency 문제를 데이터(로직 분석) 기반으로 체계적으로 분석하고 원인을 규명했습니다.
+
+3. 저수준 시스템 제어 능력: 리눅스 커널 API를 활용하여 하드웨어를 직접 제어하는 능력과 디바이스 드라이버의 구조에 대한 깊은 이해를 얻었습니다.
+
+4. 일반 리눅스 커널 + hrtimer만으로는 RX 실시간 안정화가 어렵다는 점을 확인했으며, 실시간 처리를 위해 PRU/RTOS 등 하드 RT 자원의 필요성을 절실히 체감했습니다. 
+
